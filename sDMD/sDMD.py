@@ -17,6 +17,8 @@ Version: 1.0
 Email: jyli@dtu.dk
 """
 from enum import Enum
+import os
+import matplotlib.pyplot as plt
 
 import numpy as np
 
@@ -184,7 +186,7 @@ class sDMD_base(object):
 
     @property
     def rank(self):
-        return self.U.shape[1]
+        return self.Ux.shape[1] # TODO check: Changed from self.U.shape[1] to self.Ux.shape[1]
 
     @property
     def A(self):
@@ -379,3 +381,281 @@ class sDMDc(sDMD_base):
         modes = Ux1 @ eigvecK
 
         return modes, eigvals
+
+    def get_current_augmented_input_for_prediction(self):
+        """
+        Retrieves the current augmented input vector from internal state buffers.
+        
+        This method constructs the augmented input vector by combining the current
+        delayed Hankelized states from Xstack1 and delayed control inputs from Ustack.
+        The resulting vector represents the system state required for predicting the
+        next time step using the learned DMD operator.
+        
+        Returns:
+            np.ndarray: Augmented input vector of shape (nx*s + nu, 1) containing
+                       stacked delayed state and control information.
+                       
+        Note:
+            This method should be called before update() when predicting future states
+            based on historical data up to the current time step k-1.
+        """
+        current_X_hank_delayed = self.Xstack1()
+        current_U_delayed = self.Ustack()
+        return np.vstack([current_X_hank_delayed, current_U_delayed])
+
+    def predict_next_raw_state_from_augmented(self, current_augmented_input):
+        """
+        Predicts the next raw state vector using the learned DMD operator.
+        
+        This method applies the reduced-order DMD model to predict the next state
+        given an augmented input vector containing delayed states and controls.
+        The prediction follows the learned mapping from augmented input space to
+        the next state in physical coordinates.
+        
+        Args:
+            current_augmented_input (np.ndarray): Augmented input vector of shape
+                                                 (nx*s + nu, 1) containing delayed
+                                                 states and control inputs.
+        
+        Returns:
+            np.ndarray: Predicted next raw state vector of shape (nx, 1), or
+                       array of NaNs if prediction fails due to model unavailability
+                       or dimensional incompatibility.
+                       
+        Raises:
+            Warnings are printed for model unavailability or dimensional mismatches
+            rather than raising exceptions to maintain robustness in streaming applications.
+        """
+        if self.A is None or self.Ux is None or self.Uy is None:
+            return np.full((self.nx, 1), np.nan)
+        
+        if current_augmented_input.shape[0] != self.Ux.shape[0]:
+            return np.full((self.nx, 1), np.nan)
+
+        try:
+            y_reduced_pred = self.A @ (self.Ux.T @ current_augmented_input)
+            y_hank_physical_pred = self.Uy @ y_reduced_pred
+            
+            predicted_x_next_raw = y_hank_physical_pred[:self.nx, 0]
+            return predicted_x_next_raw.reshape(-1, 1)
+        except Exception:
+            return np.full((self.nx, 1), np.nan)
+
+    def predict_horizon(self, x_initial_raw_history, u_future_raw_sequence, num_predict_steps):
+        """
+        Performs multi-step ahead prediction using the learned sDMDc model.
+        
+        This method implements a rolling prediction scheme where the model iteratively
+        predicts future states by feeding predicted outputs back as inputs for subsequent
+        predictions. The method handles proper initialization of internal state buffers
+        and maintains consistency with the training data structure.
+        
+        Args:
+            x_initial_raw_history (np.ndarray): Historical state data of shape (nx, s+f-1)
+                                               required to initialize internal stackers.
+                                               The last column represents the current state x_k.
+            u_future_raw_sequence (np.ndarray): Future control sequence of shape 
+                                               (nu, num_predict_steps+f-1) containing
+                                               historical controls for initialization
+                                               followed by future control inputs.
+            num_predict_steps (int): Number of future time steps to predict.
+        
+        Returns:
+            np.ndarray: Predicted state trajectory of shape (nx, num_predict_steps)
+                       containing the predicted evolution of the system state, or
+                       None if model components are unavailable.
+                       
+        Raises:
+            ValueError: If input dimensions are incompatible with model requirements.
+            
+        Note:
+            The method creates temporary stacker objects to avoid modifying the
+            internal state of the main model during prediction operations.
+        """
+        if self.A is None or self.Ux is None or self.Uy is None:
+            print("Model (A, Ux, or Uy) not trained. Cannot perform multi-step prediction.")
+            return None
+
+        required_x_hist_len = self.s + self.f - 1
+        if x_initial_raw_history.shape[0] != self.nx or x_initial_raw_history.shape[1] < required_x_hist_len:
+            raise ValueError(
+                f"x_initial_raw_history shape {x_initial_raw_history.shape} is invalid. "
+                f"Expected ({self.nx}, >= {required_x_hist_len})."
+            )
+        
+        required_u_len = num_predict_steps + self.f - 1
+        if u_future_raw_sequence.shape[0] != self.nu or u_future_raw_sequence.shape[1] < required_u_len:
+             raise ValueError(
+                 f"u_future_raw_sequence shape {u_future_raw_sequence.shape} is invalid. "
+                 f"Expected ({self.nu}, >= {required_u_len})."
+            )
+
+        predicted_X_raw_horizon = np.zeros((self.nx, num_predict_steps))
+        
+        pred_Xstack0 = Stacker(self.nx, self.s)
+        pred_Xstack1 = Delayer(self.nx * self.s, self.f)
+        pred_Ustack  = Delayer(self.nu, self.f)
+
+        # Initialize prediction stackers with historical data
+        for i in range(self.s):
+            _ = pred_Xstack0.update(x_initial_raw_history[:, -(self.s-i)])
+        
+        temp_hist_x0_hank_for_Xstack1 = []
+        temp_s0_for_priming = Stacker(self.nx, self.s)
+        for i in range(required_x_hist_len):
+            _ = temp_s0_for_priming.update(x_initial_raw_history[:, i])
+            if i >= self.s - 1:
+                temp_hist_x0_hank_for_Xstack1.append(temp_s0_for_priming())
+        for i in range(self.f):
+            _ = pred_Xstack1.update(temp_hist_x0_hank_for_Xstack1[-(self.f-i)])
+
+        for i in range(self.f):
+             _ = pred_Ustack.update(u_future_raw_sequence[:, i].reshape(-1,1))
+
+        current_x_raw_for_loop = x_initial_raw_history[:, -1].reshape(-1,1)
+
+        # Iterative prediction loop
+        for i in range(num_predict_steps):
+            current_u_raw_for_stacker = u_future_raw_sequence[:, self.f + i].reshape(-1,1)
+            
+            x0_hank = pred_Xstack0.update(current_x_raw_for_loop)
+            x_hank_delayed = pred_Xstack1.update(x0_hank)
+            u_delayed = pred_Ustack.update(current_u_raw_for_stacker)
+            
+            aug_input_for_step = np.vstack([x_hank_delayed, u_delayed])
+
+            next_x_raw_pred = self.predict_next_raw_state_from_augmented(aug_input_for_step)
+            
+            if np.any(np.isnan(next_x_raw_pred)):
+                print(f"Multi-step prediction encountered NaN at step {i+1}. Stopping.")
+                return predicted_X_raw_horizon[:, :i]
+            
+            predicted_X_raw_horizon[:, i] = next_x_raw_pred.flatten()
+            current_x_raw_for_loop = next_x_raw_pred
+            
+        return predicted_X_raw_horizon
+
+    def plot_model_eigenvalues(self, A_true_for_comparison=None, 
+                               save_path_prefix="plots/sdmdc_model_eigs", 
+                               title_info=""):
+        """
+        Visualizes eigenvalues of the learned reduced-order operator.
+        
+        This method generates a complex plane plot showing the eigenvalues of the
+        learned DMD operator, optionally comparing them with eigenvalues from a
+        reference system matrix. The visualization includes the unit circle for
+        stability assessment and handles multi-step prediction operators by
+        showing appropriate power relationships.
+        
+        Args:
+            A_true_for_comparison (np.ndarray, optional): Reference system matrix
+                                                         for eigenvalue comparison.
+            save_path_prefix (str, optional): File path prefix for saving the plot.
+                                             Defaults to "plots/sdmdc_model_eigs".
+            title_info (str, optional): Additional information for plot title.
+        
+        Note:
+            The method automatically creates the output directory if it does not exist
+            and handles numerical errors gracefully by printing appropriate warnings.
+            For multi-step operators (f > 1), both original and power-scaled eigenvalues
+            are displayed when a reference system is provided.
+        """
+        if self.A is None:
+            print("Model operator A is None. Cannot plot eigenvalues.")
+            return
+
+        try:
+            eigvals_learned_A_tilde = np.linalg.eigvals(self.A)
+
+            plt.figure(figsize=(7, 7))
+            plt.scatter(np.real(eigvals_learned_A_tilde), np.imag(eigvals_learned_A_tilde),
+                        marker='o', s=80, facecolors='none', edgecolors='red', lw=1.5,
+                        label=f'Learned A_tilde Evals (f_train={self.f})')
+
+            if A_true_for_comparison is not None:
+                eigvals_true_A = np.linalg.eigvals(A_true_for_comparison)
+                plt.scatter(np.real(eigvals_true_A), np.imag(eigvals_true_A),
+                            marker='x', s=100, color='black', lw=1.5,
+                            label='True System A Evals (λ_true)')
+                if self.f > 1:
+                    eigvals_true_f_step_A = eigvals_true_A ** self.f
+                    plt.scatter(np.real(eigvals_true_f_step_A), np.imag(eigvals_true_f_step_A),
+                                marker='P', s=120, color='green', alpha=0.7,
+                                label=f'True A Evals (λ_true^{self.f})')
+
+            theta = np.linspace(0, 2 * np.pi, 100)
+            plt.plot(np.cos(theta), np.sin(theta), 'k--', lw=0.5, label='Unit Circle')
+
+            plt.xlabel("Real Part")
+            plt.ylabel("Imaginary Part")
+            plot_title = f"sDMDc Model Eigenvalue Comparison"
+            if title_info: plot_title += f" - {title_info}"
+            plt.title(plot_title)
+            plt.legend(fontsize=9)
+            plt.axis('equal')
+            plt.grid(True)
+            
+            plot_dir = os.path.dirname(save_path_prefix)
+            if plot_dir and not os.path.exists(plot_dir):
+                os.makedirs(plot_dir)
+            
+            filename_suffix = title_info.replace('=', '').replace('(', '').replace(')', '').replace(',', '_').replace(' ', '_').replace('/', '')
+            filepath = f"{save_path_prefix}_{filename_suffix}.png"
+            plt.savefig(filepath)
+            plt.close()
+            print(f"Saved model eigenvalues plot to {filepath}")
+
+        except np.linalg.LinAlgError:
+            print(f"Could not compute/plot eigenvalues (LinAlgError) for f_train={self.f}.")
+        except Exception as e:
+            print(f"Error plotting model eigenvalues: {e}")
+
+    def get_effective_AB(self):
+        """
+        Extracts effective full-order system matrices from the learned reduced-order model.
+        
+        This method attempts to recover interpretable system matrices A_eff and B_eff
+        that approximate the original system dynamics x_{k+1} = A_eff * x_k + B_eff * u_k.
+        The extraction is most meaningful for models trained with minimal state stacking
+        (s=1) and single-step prediction (f=1), where the learned operator directly
+        approximates the system transition matrix.
+        
+        Returns:
+            tuple: (A_eff, B_eff) where A_eff is the effective state transition matrix
+                   of shape (nx, nx) and B_eff is the effective input matrix of shape
+                   (nx, nu). Returns (None, None) if extraction conditions are not met
+                   or if model components are unavailable.
+                   
+        Note:
+            The method provides warnings when extraction conditions (s=1, f=1) are not
+            strictly satisfied, as the interpretation of the extracted matrices becomes
+            more complex for augmented state spaces and multi-step operators.
+        """
+        if not (self.s == 1 and self.f == 1):
+            print("Warning: Effective A, B extraction is primarily for s=1, f=1 models.")
+
+        if self.A is None or self.Ux is None or self.Uy is None:
+            print("Model components (A, Ux, Uy) not available for A,B extraction.")
+            return None, None
+
+        try:
+            Operator_learned_full = self.Uy @ self.A @ self.Ux.T
+            A_B_block = Operator_learned_full[:self.nx, :] 
+
+            expected_input_dim_for_AB_extraction = self.nx + self.nu
+            if self.s == 1 and self.f == 1 and A_B_block.shape == (self.nx, expected_input_dim_for_AB_extraction):
+                A_eff = A_B_block[:, :self.nx]
+                B_eff = A_B_block[:, self.nx:]
+                return A_eff, B_eff
+            else:
+                print(
+                    f"Cannot directly extract A_eff, B_eff. Conditions s=1, f=1 might not be strictly met "
+                    f"for this interpretation, or operator shape is unexpected. "
+                    f"Operator_AB_block shape: {A_B_block.shape}, Expected: ({self.nx}, {expected_input_dim_for_AB_extraction}). "
+                    f"Model s={self.s}, f={self.f}."
+                )
+                return None, None
+
+        except Exception as e:
+            print(f"Error during effective A, B extraction: {e}")
+            return None, None
