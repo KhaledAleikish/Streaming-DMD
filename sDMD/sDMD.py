@@ -184,7 +184,7 @@ class sDMD_base(object):
 
     @property
     def rank(self):
-        return self.U.shape[1]
+        return self.Ux.shape[1]
 
     @property
     def A(self):
