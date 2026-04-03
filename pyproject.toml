@@ -8,7 +8,9 @@ packages = [{ include = "sDMD" }]
 
 [tool.poetry.dependencies]
 python = "^3.8"
-numpy = "^1.16.5"
+# Upper bound excludes NumPy 3+ until tested. NumPy 2.x is required by recent cvxpy / GridSim stacks;
+# ``^1.16.5`` previously forced pip to downgrade to 1.26.x when installing editable streaming-dmd.
+numpy = ">=1.16.5,<3"
 
 [tool.poetry.group.examples.dependencies]
 matplotlib = "^3.7.2"

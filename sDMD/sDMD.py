@@ -343,6 +343,98 @@ class sDMDc(sDMD_base):
 
         super().__init__(XU_hank, Y_hank, rmin, rmax, **kwargs)
 
+    @classmethod
+    def from_pooled_pairs(cls, Z_minus, Z_plus, U_minus, rmin, rmax, f=1, s=1, **kwargs):
+        """
+        Initialize from pooled DMDc pair matrices without sequential Hankel construction.
+
+        Stacks $X_{\\mathrm{in}} = [Z^-; U^-]$, $Y_{\\mathrm{in}} = Z^+$ columnwise and
+        calls ``sDMD_base.__init__`` on $(X_{\\mathrm{in}}, Y_{\\mathrm{in}})$. Instantiates
+        ``Stacker`` / ``Delayer`` for subsequent ``update`` / ``prime_stacks``.
+
+        For $s>1$ or $f>1$, ``Z_minus``, ``Z_plus``, ``U_minus`` must already match the
+        augmented shapes that the sequential constructor would pass to ``sDMD_base``
+        after its trim (this routine does not replay ``Stacker`` / ``Delayer`` on pooled
+        columns).
+
+        Parameters
+        ----------
+        Z_minus, Z_plus : ndarray, shape (n_x, N_p)
+        U_minus : ndarray, shape (n_u, N_p)
+        rmin, rmax : int
+            As in ``sDMD_base``.
+        f, s : int
+            Delay / stack parameters (stored on the instance; must match delayed data if
+            $s>1$ or $f>1$).
+        """
+        Z_minus = np.asarray(Z_minus, dtype=float)
+        Z_plus = np.asarray(Z_plus, dtype=float)
+        U_minus = np.asarray(U_minus, dtype=float)
+        if Z_minus.ndim != 2 or Z_plus.ndim != 2 or U_minus.ndim != 2:
+            raise ValueError("Z_minus, Z_plus, and U_minus must be 2D arrays.")
+        n_p = Z_minus.shape[1]
+        nx = Z_minus.shape[0]
+        nu = U_minus.shape[0]
+        if Z_plus.shape != (nx, n_p) or U_minus.shape[1] != n_p:
+            raise ValueError(
+                f"Shape mismatch: expected Z_plus ({nx}, {n_p}), U_minus ({nu}, {n_p}); "
+                f"got Z_plus {Z_plus.shape}, U_minus {U_minus.shape}."
+            )
+        if n_p < 1:
+            raise ValueError("Need at least one pooled pair column.")
+
+        instance = cls.__new__(cls)
+        instance.s = s
+        instance.f = f
+        instance.nx = nx
+        instance.nu = nu
+        instance.Xstack0 = Stacker(instance.nx, s)
+        instance.Xstack1 = Delayer(instance.nx * s, f)
+        instance.Ustack = Delayer(instance.nu, f)
+
+        xu_in = np.vstack([Z_minus, U_minus])
+        y_in = Z_plus
+        sDMD_base.__init__(instance, xu_in, y_in, rmin, rmax, **kwargs)
+        return instance
+
+    def prime_stacks(self, X_warmup, U_warmup):
+        """
+        Advance internal ``Stacker`` / ``Delayer`` state along a time-ordered tail
+        without a rank-one ``sDMD_base.update``.
+
+        Use $T_{\\mathrm{warm}} \\ge s + f - 1$ columns immediately preceding the first
+        streaming ``update`` so delay registers match a continuous trajectory.
+
+        Parameters
+        ----------
+        X_warmup : ndarray, shape (n_x, T_warm)
+        U_warmup : ndarray, shape (n_u, T_warm)
+        """
+        X_warmup = np.asarray(X_warmup, dtype=float)
+        U_warmup = np.asarray(U_warmup, dtype=float)
+        if X_warmup.ndim != 2 or U_warmup.ndim != 2:
+            raise ValueError("X_warmup and U_warmup must be 2D arrays.")
+        t_warm = X_warmup.shape[1]
+        if U_warmup.shape[1] != t_warm:
+            raise ValueError("X_warmup and U_warmup must have the same number of columns.")
+        if X_warmup.shape[0] != self.nx or U_warmup.shape[0] != self.nu:
+            raise ValueError(
+                f"Expected X_warmup ({self.nx}, *), U_warmup ({self.nu}, *); "
+                f"got {X_warmup.shape}, {U_warmup.shape}."
+            )
+        min_warm = self.s + self.f - 1
+        if t_warm < min_warm:
+            raise ValueError(
+                f"Need at least s + f - 1 = {min_warm} warmup columns; got {t_warm}."
+            )
+
+        for t in range(t_warm):
+            x_in = X_warmup[:, t].reshape(-1, 1)
+            u_in = U_warmup[:, t].reshape(-1, 1)
+            yhank = self.Xstack0.update(x_in)
+            self.Xstack1.update(yhank)
+            self.Ustack.update(u_in)
+
     def update(self, x_in, u_in):
 
         x_in = x_in.reshape(-1, 1)
